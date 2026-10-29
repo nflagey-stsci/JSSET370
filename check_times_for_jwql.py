@@ -168,14 +168,12 @@ def compare_times(fits_fn):
         max_discr_corr = np.max(np.abs(groups_df['corr_diff_group_end_time']))
 
         # Print results on screen for now
-        if n_discr > -1:
+        if n_discr_corr > 0:
             print(f'{fits_fn}, {readpatt},'
                   f' {n_discr / len(groups_rec)*100:.1f}%,'
                   f' {avg_discr:.5f}, {max_discr:.5f}',
                   f' ---> {n_discr_corr / len(groups_rec)*100:.1f}%,'
                   f' {avg_discr_corr:.5f}, {max_discr_corr:.5f}')
-
-        breakpoint()
 
         # ===== TODO: rebuild the INT_TIMES table with a model
 
@@ -188,8 +186,6 @@ def compare_times(fits_fn):
         # Then we have a model of the times, from which we can extract those
         # for each integration and build the INT_TIMES table
         new_int_end_times = []
-
-        breakpoint()
 
 
 def get_num_reset_rows(instrume: str, subarray: str, readpatt: str) -> float:
@@ -251,7 +247,7 @@ all_tframes = []
 fits_fns = sorted(Path('fitsfiles').glob('*fits'))
 
 print('Files with new group end times more than 64ms away from the old')
-print('fits_fn, readpatt, f_discrepancies, mean_discrepancy(ms), max_discrepancy(ms)')
+print('fits_fn, readpatt, f_discrepancies, mean_discrepancy(ms), max_discrepancy(ms)'
+      ' ---> after average offset correction')
 for fits_fn in fits_fns:
-    if 'jw02594001001_04101_00001' in str(fits_fn):
-        compare_times(fits_fn)
+    compare_times(fits_fn)
