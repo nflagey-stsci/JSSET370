@@ -2,7 +2,6 @@
 # too much from old algorithm
 import pandas as pd
 from astropy.io import fits
-from astropy.time import Time
 from datetime import datetime, timedelta
 import numpy as np
 from pathlib import Path
@@ -169,7 +168,7 @@ def compare_times(fits_fn):
 
         # Print results on screen for now
         if n_discr_corr > 0:
-            print(f'{fits_fn}, {readpatt},'
+            print(f'{fits_fn}, {readpatt}, {subarray},'
                   f' {n_discr / len(groups_rec)*100:.1f}%,'
                   f' {avg_discr:.5f}, {max_discr:.5f}',
                   f' ---> {n_discr_corr / len(groups_rec)*100:.1f}%,'
@@ -186,6 +185,8 @@ def compare_times(fits_fn):
         # Then we have a model of the times, from which we can extract those
         # for each integration and build the INT_TIMES table
         new_int_end_times = []
+
+        # breakpoint()
 
 
 def get_num_reset_rows(instrume: str, subarray: str, readpatt: str) -> float:
@@ -247,7 +248,8 @@ all_tframes = []
 fits_fns = sorted(Path('fitsfiles').glob('*fits'))
 
 print('Files with new group end times more than 64ms away from the old')
-print('fits_fn, readpatt, f_discrepancies, mean_discrepancy(ms), max_discrepancy(ms)'
+print('fits_fn, readpatt, subarray, f_discrepancies, mean_discrepancy(ms), max_discrepancy(ms)'
       ' ---> after average offset correction')
 for fits_fn in fits_fns:
+    # if 'jw05177001001_04102_00001-seg006_nrs1_uncal' in str(fits_fn):
     compare_times(fits_fn)
