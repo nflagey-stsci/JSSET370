@@ -1,6 +1,6 @@
 # Check times from GROUP and INT_TIMES table with new algorithm do not differ
 # too much from old algorithm
-
+import pandas as pd
 from astropy.io import fits
 from astropy.time import Time
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ import sqlite3
 def compare_times(fits_fn):
 
     # Open FITS
-    with (fits.open(fits_fn, mode='update') as fits_hdul):
+    with fits.open(fits_fn) as fits_hdul:
 
         # Getting parameters from primary header
         ngroups = fits_hdul[0].header['NGROUPS']
@@ -27,6 +27,15 @@ def compare_times(fits_fn):
         instrume = fits_hdul[0].header['INSTRUME']
         subarray = fits_hdul[0].header['SUBARRAY']
         readpatt = fits_hdul[0].header['READPATT']
+        zerofram = fits_hdul[0].header['ZEROFRAM']
+
+        # Segmented files
+        if 'seg' in str(fits_fn):
+            intstart = fits_hdul[0].header['INTSTART']
+            intend = fits_hdul[0].header['INTEND']
+        else:
+            intstart = 1
+            intend = nints
 
         # Get numResetRows from db file
         nresetrows = get_num_reset_rows(
@@ -36,6 +45,47 @@ def compare_times(fits_fn):
         # Getting all info from GROUP and INT_TIMES tables
         groups_rec = fits_hdul['GROUP'].data
         inttimes_rec = fits_hdul['INT_TIMES'].data
+        # Convert to pd.DF to make it easier to play with
+        groups_df = pd.DataFrame(groups_rec)
+        inttimes_df = pd.DataFrame(inttimes_rec)
+        # Drop bary_end_time and helio_end_time because of data type issue
+        groups_df.drop(columns=['bary_end_time', 'helio_end_time'],
+                       inplace=True)
+
+        # The group_number and integration_number from the records table is
+        # giving the first group/int included in the next "image". We want the
+        # last group/int instead so we shift all entries by 1 group down,
+        # remove the first entry, and add a last entry ngroups/intend
+
+        # Get "image" group and integration ending numbers
+        group_numbers = groups_df['group_number'].to_numpy()
+        integration_numbers = groups_df['integration_number'].to_numpy()
+        group_numbers = group_numbers - 1
+        if zerofram:
+            integration_numbers = np.where(
+                group_numbers == -1,
+                integration_numbers - 1,
+                integration_numbers
+            )
+            group_numbers = np.where(
+                group_numbers == -1,
+                ngroups,
+                group_numbers
+            )
+        else:
+            integration_numbers = np.where(
+                group_numbers == 0,
+                integration_numbers - 1,
+                integration_numbers
+            )
+            group_numbers = np.where(
+                group_numbers == 0,
+                ngroups,
+                group_numbers
+            )
+        # Store new values, skip first, add last
+        groups_df['end_group_number'] = np.append(group_numbers[1:], ngroups)
+        groups_df['end_integration_number'] = np.append(integration_numbers[1:], intend)
 
         # ----- Implement JWSTSDP code to compute the time entries -----
 
@@ -54,79 +104,92 @@ def compare_times(fits_fn):
 
         # Obtain final group end time, convert to datetime object
         dt_format = "%Y-%m-%dT%H:%M:%S.%f"
-        group_end_datetime = datetime.strptime(groups_rec[-1]['group_end_time'],
-                                               dt_format)
+        group_end_datetime = pd.to_datetime(
+            groups_df['group_end_time'].iloc[-1])
 
         # Recursively calculate all group times backwards from the last entry
         all_group_end_times = []
         all_grp_nums = []
         all_int_nums = []
-        # Make lists for entries that are in the existing table
-        new_group_end_times = [group_end_datetime.strftime(dt_format)]
+        # Make lists for entries that are in the existing table, starting from last
+        new_group_end_times = [groups_df['group_end_time'].iloc[-1]]
         # Loop through the total number of groups, starting with the final packets group_end_time
         # to determine the group start and end times for each group in each integration
-        grp_num = groups_rec[-1]['group_number']
-        int_num = groups_rec[-1]['integration_number']
+        grp_num = ngroups
+        int_num = intend
         for i in range(1, tot_grps):
-            grp_num -= 1
             # If we're at the beginning of an integration, the grp_time is longer
-            if grp_num == 0:
+            if (i % ngroups) == 0:
                 grp_time = grp_duration + int_gap_time
                 grp_num = ngroups
                 int_num -= 1
             # Normal group time between each group within an integration
             else:
                 grp_time = grp_duration + grp_gap_time
+                grp_num -= 1
+
+            # break in segmented files
+            if int_num < intstart:
+                break
+
             # Calculate times
             group_end_datetime = group_end_datetime - timedelta(seconds=grp_time)
             # Store all times for model
             all_group_end_times.append(group_end_datetime.strftime(dt_format))
             all_grp_nums.append(grp_num)
             all_int_nums.append(int_num)
-            # Add new times if the old record has  entry for (int_num, grp_num)
-            if len(groups_rec[(groups_rec['group_number'] == grp_num)
-                              & (groups_rec['integration_number'] == int_num)]) == 1:
+            # Add new times if the old record has entry for (int_num, grp_num)
+            if len(groups_df.loc[(groups_df['end_group_number'] == grp_num)
+                                 & (groups_df['end_integration_number'] == int_num)]) == 1:
                 new_group_end_times.append(group_end_datetime.strftime(dt_format))
 
-        # Reverse order to match original table
-        new_end_datetime = np.flip(np.array([
-            datetime.fromisoformat(s)
-            for s in new_group_end_times
-        ]))
-        # Difference between OLD and NEW in seconds
-        old_end_datetime = np.array([
-            datetime.fromisoformat(s)
-            for s in groups_rec['group_end_time']
-        ])
-        diff_end_datetime = (new_end_datetime - old_end_datetime)/timedelta(seconds=1)
+        # Add new column
+        groups_df['new_group_end_time'] = np.flip(new_group_end_times)
+
+        # Compute difference NEW - OLD
+        groups_df['diff_group_end_time'] = (
+                pd.to_datetime(groups_df['new_group_end_time'])
+                - pd.to_datetime(groups_df['group_end_time'])
+        ) / timedelta(seconds=1)
 
         # Check if any difference is greater than 64ms
-        n_discrepancies = np.sum(np.abs(diff_end_datetime) > 64e-3)
-        avg_discrepancy = np.mean(np.abs(diff_end_datetime))
-        max_discrepancy = np.max(np.abs(diff_end_datetime))
-        if n_discrepancies > -1:
-            print(f'{fits_fn}, {readpatt},'
-                  f' {n_discrepancies / len(groups_rec)*100:.1f}%,'
-                  f' {avg_discrepancy:.5f}, {max_discrepancy:.5f}')
+        n_discr = np.sum(
+            groups_df['diff_group_end_time'].abs() > 64e-3)
+        avg_discr = np.mean(groups_df['diff_group_end_time'])
+        max_discr = np.max(np.abs(groups_df['diff_group_end_time']))
 
-        # If avg_discrepancy is large, correct all times by this amount
-        new_end_datetime -= timedelta(seconds=avg_discrepancy)
+        # Correct all times by average discrepancy to account for systematics
+        groups_df['corr_diff_group_end_time'] = (
+                groups_df['diff_group_end_time'] - avg_discr)
+        # Check if any difference is greater than 64ms after offset correction
+        n_discr_corr = np.sum(
+            groups_df['corr_diff_group_end_time'].abs() > 64e-3)
+        avg_discr_corr = np.mean(groups_df['corr_diff_group_end_time'])
+        max_discr_corr = np.max(np.abs(groups_df['corr_diff_group_end_time']))
+
+        # Print results on screen for now
+        if n_discr > -1:
+            print(f'{fits_fn}, {readpatt},'
+                  f' {n_discr / len(groups_rec)*100:.1f}%,'
+                  f' {avg_discr:.5f}, {max_discr:.5f}',
+                  f' ---> {n_discr_corr / len(groups_rec)*100:.1f}%,'
+                  f' {avg_discr_corr:.5f}, {max_discr_corr:.5f}')
+
+        breakpoint()
+
+        # ===== TODO: rebuild the INT_TIMES table with a model
 
         # Offset all new times for model
         all_group_end_times = np.array([
             datetime.fromisoformat(s)
             for s in new_group_end_times
-        ]) - timedelta(seconds=avg_discrepancy)
-
-        # Convert times to UTC and MJD for populating the GROUP table
-        new_end_utc_mjd = []
-        for i in range(len(new_end_datetime)):
-            tmp_end_time = new_end_datetime[i].strftime(dt_format)
-            new_end_utc_mjd.append(Time(tmp_end_time, format='isot', scale='utc').mjd)
+        ]) - timedelta(seconds=avg_discr)
 
         # Then we have a model of the times, from which we can extract those
         # for each integration and build the INT_TIMES table
         new_int_end_times = []
+
+        breakpoint()
 
 
 def get_num_reset_rows(instrume: str, subarray: str, readpatt: str) -> float:
@@ -190,4 +253,5 @@ fits_fns = sorted(Path('fitsfiles').glob('*fits'))
 print('Files with new group end times more than 64ms away from the old')
 print('fits_fn, readpatt, f_discrepancies, mean_discrepancy(ms), max_discrepancy(ms)')
 for fits_fn in fits_fns:
-    compare_times(fits_fn)
+    if 'jw02594001001_04101_00001' in str(fits_fn):
+        compare_times(fits_fn)
