@@ -1,5 +1,7 @@
 # Check times from GROUP and INT_TIMES table with new algorithm do not differ
 # too much from old algorithm
+import sys
+
 from astropy.io import fits
 from datetime import datetime, timedelta
 from get_engdb import get_telem
@@ -13,7 +15,7 @@ import sqlite3
 
 # ===== MAIN FUNCTIONS ========================================================
 
-def compare_times(fits_fn, force_tframe=None):
+def compare_times(fits_fn):
 
     # Open FITS
     with fits.open(fits_fn) as fits_hdul:
@@ -36,17 +38,10 @@ def compare_times(fits_fn, force_tframe=None):
         date_beg = fits_hdul[0].header['DATE-BEG']
         date_end = fits_hdul[0].header['DATE-END']
 
-        # If we want to for a different TFRAME than that in the header
-        if force_tframe is not None:
-            tframe = force_tframe
-
-        # Get first and last INT for segmented files
+        # Abort if segmented file
         if 'seg' in str(fits_fn):
-            int_start = fits_hdul[0].header['INTSTART']
-            int_end = fits_hdul[0].header['INTEND']
-        else:
-            int_start = 1
-            int_end = nints
+            print('This code should not be used on segmented files')
+            sys.exit()
 
         # ----- Get numResetRows for that visit file -----
 
@@ -100,7 +95,7 @@ def compare_times(fits_fn, force_tframe=None):
             )
         # Store new values, skip first, add last
         groups_df['end_group_number'] = np.append(group_numbers[1:], ngroups)
-        groups_df['end_integration_number'] = np.append(integration_numbers[1:], int_end)
+        groups_df['end_integration_number'] = np.append(integration_numbers[1:], nints)
 
         # ----- Fetch SC clock drift telemetry -----
 
@@ -117,7 +112,7 @@ def compare_times(fits_fn, force_tframe=None):
         def objective(offset):
             # compute new group end times with a free offset parameter
             tmp_df = compute_group_end_times(
-                groups_df, ngroups, nints, int_start, int_end,
+                groups_df, ngroups, nints,
                 nframes, tframe, groupgap, nresets,
                 drpfrms3, nresetrows,
                 offset=offset
@@ -126,100 +121,54 @@ def compare_times(fits_fn, force_tframe=None):
             predicted = np.interp(pd.to_datetime(sc_clock_df['time']),
                                  pd.to_datetime(groups_df['new_group_end_time']),
                                  groups_df['corr_diff_group_end_time'])
-            # avoid any y-offset
-            predicted += np.mean(expected) - np.mean(predicted)
+            # avoid any y-offset (SC clock return to zero does not have to mean
+            # (OLD - NEW is also zero)
+            y_offset = np.mean(expected) - np.mean(predicted)
+            predicted += y_offset
+
+            # plot
+            fig, ax = plt.subplots(layout='constrained', figsize=(10, 6))
+            ax.plot(pd.to_datetime(groups_df['group_end_time']),
+                    (groups_df['corr_diff_group_end_time'] + y_offset) * 1e3,
+                    'k+:', label='(OLD - NEW) after correction')
+            ax.plot(sc_clock_df['time'],
+                    predicted * 1e3,
+                    'g+:')
+            # overplot SC clock to ground difference
+            ax.plot(sc_clock_df['time'],
+                    sc_clock_df['value'] / 1e3,
+                    'r.', alpha=0.5, label='SC clock to ground difference')
+            # labels and stuff
+            ax.set_ylabel('Time difference (ms)')
+            ax.set_xlabel('Date')
+            ax.set_title(fits_fn.name)
+            ax.grid()
+            plt.legend()
+            plt.show()
+
             # return metric of success
             return np.mean((predicted - expected) ** 2)
 
         # optimize
         result = minimize_scalar(
             objective,
-            bounds=(-1e-2, 1e-2),
+            bounds=(-1e-3, 1e-3),
             method='bounded'
         )
         # TODO: convert offset into a 10us change?
         best_offset = result.x
         # assuming the overhead from Eddie: 0.9512ms
-        best_10us = (best_offset - 0.9512e-3) / nresetrows
+        best_10us = (best_offset - 0.9512e-3) / nresetrows + 10e-6
+        print(best_offset, best_10us)
 
-        breakpoint()
-
-        # ----- Implement JWSTSDP code to compute the time entries -----
-
-        # Determine how many total groups there are in this exposure
-        tot_grps = ngroups * nints
-        # Calculate the duration of a single group
-        grp_duration = nframes * tframe
-        # Calculate the time between groups
-        grp_gap_time = groupgap * tframe
-        # Calculate background row reset duration
-        bkgd_row_reset_dur = 0.00001
-        # Calculate the gap between integrations
-        int_gap_time = compute_int_gap_time(
-            nresetrows, bkgd_row_reset_dur, nresets, tframe, drpfrms3)
-
-        # Obtain final group end time, convert to datetime object
-        dt_format = "%Y-%m-%dT%H:%M:%S.%f"
-        group_end_datetime = pd.to_datetime(
-            groups_df['group_end_time'].iloc[-1])
-
-        # Recursively calculate all group times backwards from the last entry
-        all_group_end_times = []
-        all_grp_nums = []
-        all_int_nums = []
-        # Make lists for entries that are in the existing table, starting from last
-        new_group_end_times = [groups_df['group_end_time'].iloc[-1]]
-        # Loop through the total number of groups, starting with the final packets group_end_time
-        # to determine the group start and end times for each group in each integration
-        grp_num = ngroups
-        int_num = int_end
-        for i in range(1, tot_grps):
-            # If we're at the beginning of an integration, the grp_time is longer
-            if (i % ngroups) == 0:
-                grp_time = grp_duration + int_gap_time
-                grp_num = ngroups
-                int_num -= 1
-            # Normal group time between each group within an integration
-            else:
-                grp_time = grp_duration + grp_gap_time
-                grp_num -= 1
-
-            # break in segmented files
-            if int_num < int_start:
-                break
-
-            # Calculate times
-            group_end_datetime = group_end_datetime - timedelta(seconds=grp_time)
-            # Store all times for model
-            all_group_end_times.append(group_end_datetime.strftime(dt_format))
-            all_grp_nums.append(grp_num)
-            all_int_nums.append(int_num)
-            # Add new times if the old record has entry for (int_num, grp_num)
-            if len(groups_df.loc[(groups_df['end_group_number'] == grp_num)
-                                 & (groups_df['end_integration_number'] == int_num)]) == 1:
-                new_group_end_times.append(group_end_datetime.strftime(dt_format))
-
-        # Add new column with calculated group end times
-        groups_df['new_group_end_time'] = np.flip(new_group_end_times)
-
-        # Compute difference NEW - OLD
-        groups_df['diff_group_end_time'] = (
-                pd.to_datetime(groups_df['group_end_time'])
-                - pd.to_datetime(groups_df['new_group_end_time'])
-        ) / timedelta(seconds=1)
 
         # Check if any difference is greater than 64ms
-        n_discr = np.sum(
-            groups_df['diff_group_end_time'].abs() > 64e-3)
+        n_discr = np.sum(groups_df['diff_group_end_time'].abs() > 64e-3)
         avg_discr = np.mean(groups_df['diff_group_end_time'])
         max_discr = np.max(np.abs(groups_df['diff_group_end_time']))
 
-        # Correct all times by average discrepancy to account for systematics
-        groups_df['corr_diff_group_end_time'] = (
-                groups_df['diff_group_end_time'] - avg_discr)
         # Check if any difference is greater than 64ms after offset correction
-        n_discr_corr = np.sum(
-            groups_df['corr_diff_group_end_time'].abs() > 64e-3)
+        n_discr_corr = np.sum(groups_df['corr_diff_group_end_time'].abs() > 64e-3)
         avg_discr_corr = np.mean(groups_df['corr_diff_group_end_time'])
         max_discr_corr = np.max(np.abs(groups_df['corr_diff_group_end_time']))
 
@@ -245,17 +194,13 @@ def compare_times(fits_fn, force_tframe=None):
                   f' New duration: {new_duration:.5f}s,'
                   f' Old - New duration: {old_duration - new_duration:.5f}s')
 
-        # What TFRAME would bring OLD and NEW into agreement?
-
-
-
 
         # ===== TODO: rebuild the INT_TIMES table with a model
 
         # Offset all new times for model
         all_group_end_times = np.array([
             datetime.fromisoformat(s)
-            for s in new_group_end_times
+            for s in groups_df['new_group_end_time'].values
         ]) - timedelta(seconds=avg_discr)
 
         # Then we have a model of the times, from which we can extract those
@@ -293,9 +238,7 @@ def compare_times(fits_fn, force_tframe=None):
                     bbox_inches='tight')
         plt.show()
 
-        # breakpoint()
-
-        return old_duration, new_duration, groups_df, sc_clock_df
+        return old_duration, new_duration
 
 
 def compute_int_gap_time(nresetrows, bkgd_row_reset_dur, nresets, tframe, drpfrms3, offset=1e-3):
@@ -306,7 +249,7 @@ def compute_int_gap_time(nresetrows, bkgd_row_reset_dur, nresets, tframe, drpfrm
     return int_gap_time + offset
 
 
-def compute_group_end_times(df, ngroups, nints, int_start, int_end,
+def compute_group_end_times(df, ngroups, nints,
                             nframes, tframe, groupgap, nresets, drpfrms3, nresetrows, offset=1e-3):
     # All arguments are those found in the header of the FITS file except the
     # 10us which we let free to vary: we want to figure out
@@ -336,7 +279,7 @@ def compute_group_end_times(df, ngroups, nints, int_start, int_end,
     # Loop through the total number of groups, starting with the final packets group_end_time
     # to determine the group start and end times for each group in each integration
     grp_num = ngroups
-    int_num = int_end
+    int_num = nints
     for i in range(1, tot_grps):
         # If we're at the beginning of an integration, the grp_time is longer
         if (i % ngroups) == 0:
@@ -347,10 +290,6 @@ def compute_group_end_times(df, ngroups, nints, int_start, int_end,
         else:
             grp_time = grp_duration + grp_gap_time
             grp_num -= 1
-
-        # break in segmented files
-        if int_num < int_start:
-            break
 
         # Calculate times
         group_end_datetime = group_end_datetime - timedelta(seconds=grp_time)
@@ -449,35 +388,8 @@ print('fits_fn, readpatt, subarray, f_discrepancies, mean_discrepancy(ms), max_d
 for fits_fn in fits_fns:
     # if 'jw05177001001_04102_00001' in fits_fn.name:
     # if ('jw02454' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
-    if ('jw01729' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
-    # if 'jw03838001001_04102_00001' in fits_fn.name:
+    # if ('jw01729' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
+    if ('jw03838001001_' in fits_fn.name) & ('seg' not in fits_fn.name):
     # if 'nrs' in fits_fn.name:
     # if ('2457' in fits_fn.name) & ('nrs' in fits_fn.name):
-        old_d, new_d, groups_df, sc_clock_df = compare_times(fits_fn, force_tframe=None)
-        all_new_durations.append(new_d)
-        all_old_durations.append(old_d)
-
-fig, ax = plt.subplots(layout='constrained', figsize=(10, 6))
-ax.plot(all_old_durations, all_new_durations, 'k+', alpha=0.5)
-ax.set_xlabel('Old durations (s)')
-ax.set_ylabel('New durations (s)')
-ax.grid(alpha=0.25)
-plt.savefig('plots/new_vs_old_durations.pdf',
-            bbox_inches='tight')
-
-fig, ax = plt.subplots(layout='constrained', figsize=(10, 6))
-ax.plot(all_old_durations, [old-new for old, new in zip(all_old_durations, all_new_durations)], 'k+', alpha=0.5)
-ax.set_xlabel('Old durations (s)')
-ax.set_ylabel('Old durations - New durations (s)')
-ax.hlines([0.064, -0.064], xmin=0, xmax=max(all_old_durations), color='r', linestyle='dashed')
-ax.grid(alpha=0.25)
-plt.savefig('plots/diff_vs_old_durations.pdf',
-            bbox_inches='tight')
-
-
-
-# TODO: investigate jw01729 vs SC clock then incorporate into above code
-
-y_interp = np.interp(pd.to_datetime(sc_clock_df['time']),
-                     pd.to_datetime(groups_df['group_end_time']),
-                     groups_df['corr_diff_group_end_time'])
+        old_d, new_d = compare_times(fits_fn)
