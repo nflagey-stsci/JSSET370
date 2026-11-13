@@ -18,7 +18,7 @@ import sqlite3
 def compare_times(fits_fn):
 
     # Open FITS
-    with fits.open(fits_fn) as fits_hdul:
+    with (fits.open(fits_fn) as fits_hdul):
 
         # ----- Collect header parameters -----
 
@@ -109,6 +109,9 @@ def compare_times(fits_fn):
 
         # ----- Optimize JWSTSDP code to match SC clock drift -----
 
+        best_dict = {'metric': np.inf,
+                     'value': None, 'df': None, 'overlap_values': None}
+
         def objective(offset):
             # compute new group end times with a free offset parameter
             tmp_df = compute_group_end_times(
@@ -117,19 +120,27 @@ def compare_times(fits_fn):
                 drpfrms3, nresetrows,
                 offset=offset
             )
-            # interpolate new group end time onto SC clock
+            # interpolate old minus new group end times onto SC clock times
             predicted = np.interp(pd.to_datetime(sc_clock_df['time']),
-                                 pd.to_datetime(groups_df['new_group_end_time']),
-                                 groups_df['corr_diff_group_end_time'])
-            # avoid any y-offset (SC clock return to zero does not have to mean
-            # (OLD - NEW is also zero)
+                                 pd.to_datetime(tmp_df['new_group_end_time']),
+                                 tmp_df['diff_group_end_time'])
+            # correct for SC clock to ground error
             y_offset = np.mean(expected) - np.mean(predicted)
             predicted += y_offset
 
+            # apply correction to DF times as well
+            tmp_df['new_group_end_time'] = pd.to_datetime(
+                tmp_df['new_group_end_time']) + timedelta(seconds=y_offset)
+            tmp_df['diff_group_end_time'] = (tmp_df['diff_group_end_time']
+                                             + y_offset)
+
+            # convert offset into the "10us" parameter
+            ten_us = (offset - 0.9512e-3) / nresetrows + 10e-6
+
             # plot
             fig, ax = plt.subplots(layout='constrained', figsize=(10, 6))
-            ax.plot(pd.to_datetime(groups_df['group_end_time']),
-                    (groups_df['corr_diff_group_end_time'] + y_offset) * 1e3,
+            ax.plot(pd.to_datetime(tmp_df['group_end_time']),
+                    tmp_df['diff_group_end_time'] * 1e3,
                     'k+:', label='(OLD - NEW) after correction')
             ax.plot(sc_clock_df['time'],
                     predicted * 1e3,
@@ -141,26 +152,38 @@ def compare_times(fits_fn):
             # labels and stuff
             ax.set_ylabel('Time difference (ms)')
             ax.set_xlabel('Date')
-            ax.set_title(fits_fn.name)
+            fig.suptitle(fits_fn.name)
+            ax.set_title(f'IntGapTime offset = {offset*1e3:5.3g}ms  -  OR  -  0.9512ms overhead and TSAMPLE = {ten_us*1e6:5.3g}us')
             ax.grid()
             plt.legend()
             plt.show()
 
+            # compute metric of success
+            metric_of_success = np.mean((predicted - expected) ** 2)
+            # update best resul
+            if metric_of_success < best_dict['metric']:
+                best_dict.update(metric=metric_of_success,
+                                 value=offset,
+                                 df=tmp_df,
+                                 overlap_values=predicted)
+
             # return metric of success
-            return np.mean((predicted - expected) ** 2)
+            return metric_of_success
 
         # optimize
         result = minimize_scalar(
             objective,
-            bounds=(-1e-3, 1e-3),
+            bounds=(-1e-2, 1e-2),
             method='bounded'
         )
-        # TODO: convert offset into a 10us change?
-        best_offset = result.x
         # assuming the overhead from Eddie: 0.9512ms
-        best_10us = (best_offset - 0.9512e-3) / nresetrows + 10e-6
-        print(best_offset, best_10us)
+        best_10us = (result.x - 0.9512e-3) / nresetrows + 10e-6
+        print(f'\nBest offset in int_gap_time = {result.x:5.3g}s, '
+              f'which converts into a "10us" = {best_10us*1e6:5.3g}us')
 
+        # Update groups_df with optimized solution
+        groups_df = best_dict['df'].copy()
+        overlap_values = best_dict['overlap_values']
 
         # Check if any difference is greater than 64ms
         n_discr = np.sum(groups_df['diff_group_end_time'].abs() > 64e-3)
@@ -168,17 +191,16 @@ def compare_times(fits_fn):
         max_discr = np.max(np.abs(groups_df['diff_group_end_time']))
 
         # Check if any difference is greater than 64ms after offset correction
-        n_discr_corr = np.sum(groups_df['corr_diff_group_end_time'].abs() > 64e-3)
-        avg_discr_corr = np.mean(groups_df['corr_diff_group_end_time'])
-        max_discr_corr = np.max(np.abs(groups_df['corr_diff_group_end_time']))
+        # n_discr_corr = np.sum(groups_df['corr_diff_group_end_time'].abs() > 64e-3)
+        # avg_discr_corr = np.mean(groups_df['corr_diff_group_end_time'])
+        # max_discr_corr = np.max(np.abs(groups_df['corr_diff_group_end_time']))
 
         # Print results on screen for now
-        if n_discr_corr > -1:
-            print(f'{fits_fn}, {readpatt}, {subarray},'
-                  f' {n_discr / len(groups_rec)*100:.1f}%,'
-                  f' {avg_discr:.5f}, {max_discr:.5f}',
-                  f' ---> {n_discr_corr / len(groups_rec)*100:.1f}%,'
-                  f' {avg_discr_corr:.5f}, {max_discr_corr:.5f}')
+        print(f'{fits_fn}, {readpatt}, {subarray},'
+              f' {n_discr / len(groups_rec)*100:.1f}%,'
+              f' {avg_discr:.5f}, {max_discr:.5f}',)
+              # f' ---> {n_discr_corr / len(groups_rec)*100:.1f}%,'
+              # f' {avg_discr_corr:.5f}, {max_discr_corr:.5f}')
 
         # ===== "Total" duration
         old_duration = (
@@ -198,14 +220,12 @@ def compare_times(fits_fn):
         # ===== TODO: rebuild the INT_TIMES table with a model
 
         # Offset all new times for model
-        all_group_end_times = np.array([
-            datetime.fromisoformat(s)
-            for s in groups_df['new_group_end_time'].values
-        ]) - timedelta(seconds=avg_discr)
+        # all_group_end_times = (groups_df['new_group_end_time'].values
+        #                        - timedelta(seconds=avg_discr))
 
         # Then we have a model of the times, from which we can extract those
         # for each integration and build the INT_TIMES table
-        new_int_end_times = []
+        # new_int_end_times = []
 
         # === DEBUG section ===
 
@@ -223,15 +243,21 @@ def compare_times(fits_fn):
         # Show time difference between calculation and GROUP table
         fig, ax = plt.subplots(layout='constrained', figsize=(10, 6))
         ax.plot(pd.to_datetime(groups_df['group_end_time']),
-                groups_df['corr_diff_group_end_time'], 'k+:',
-                label='(OLD - NEW) after correction')
+                groups_df['diff_group_end_time'] * 1e3,
+                'k+:', label='(OLD - NEW) after correction')
+        ax.plot(sc_clock_df['time'],
+                overlap_values * 1e3,
+                'g+:')
         # overplot SC clock to ground difference
-        ax.plot(sc_clock_df['time'], sc_clock_df['value'] / 1e6,
+        ax.plot(sc_clock_df['time'],
+                sc_clock_df['value'] / 1e3,
                  'r.', alpha=0.5, label='SC clock to ground difference')
         # labels and stuff
-        ax.set_ylabel('Time (s)')
+        ax.set_ylabel('Time (ms)')
         ax.set_xlabel('Date')
-        ax.set_title(fits_fn.name)
+        fig.suptitle(fits_fn.name)
+        ax.set_title(f'IntGapTime offset = {result.x:5.3g}s  -  OR  -  '
+                     f'0.9512ms overhead and TSAMPLE = {best_10us * 1e6:5.3g}us')
         ax.grid()
         plt.legend()
         plt.savefig('plots/' + fits_fn.name.replace('.fits', '.pdf'),
@@ -312,10 +338,10 @@ def compute_group_end_times(df, ngroups, nints,
     ) / timedelta(seconds=1)
 
     # Average discrepancy
-    avg_discr = np.mean(df['diff_group_end_time'])
+    # avg_discr = np.mean(df['diff_group_end_time'])
 
     # Correct all times by average discrepancy to account for systematics
-    df['corr_diff_group_end_time'] = df['diff_group_end_time'] - avg_discr
+    # df['corr_diff_group_end_time'] = df['diff_group_end_time'] - avg_discr
 
     return df
 
@@ -388,8 +414,8 @@ print('fits_fn, readpatt, subarray, f_discrepancies, mean_discrepancy(ms), max_d
 for fits_fn in fits_fns:
     # if 'jw05177001001_04102_00001' in fits_fn.name:
     # if ('jw02454' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
-    # if ('jw01729' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
-    if ('jw03838001001_' in fits_fn.name) & ('seg' not in fits_fn.name):
+    if ('jw01729' in fits_fn.name) & ('seg' not in fits_fn.name):
+    # if ('jw03838001001_' in fits_fn.name) & ('seg' not in fits_fn.name):
     # if 'nrs' in fits_fn.name:
     # if ('2457' in fits_fn.name) & ('nrs' in fits_fn.name):
         old_d, new_d = compare_times(fits_fn)
