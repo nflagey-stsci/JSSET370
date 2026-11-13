@@ -12,6 +12,7 @@ from pathlib import Path
 from scipy.optimize import minimize_scalar
 import sqlite3
 
+dt_format = "%Y-%m-%dT%H:%M:%S.%f"
 
 # ===== MAIN FUNCTIONS ========================================================
 
@@ -102,8 +103,37 @@ def compare_times(fits_fn):
         # define mnemonic and start/end
         mnemonics = [("FGDP_SCTA_OFFSET_D", True)]
         visits = [{"start_time": date_beg, "end_time": date_end}]
-        # execute query
+        # execute query, increasing time window if needed
         sc_clock_df = get_telem(mnemonics, visits)
+        if sc_clock_df.empty:
+            print('No telemetry data found: increasing time window ...')
+            new_date_beg = date_beg
+            new_date_end = date_end
+            # get data before the observation
+            while True:
+                new_date_beg = (
+                        pd.to_datetime(new_date_beg) - timedelta(hours=12)) \
+                    .strftime(dt_format)
+                visits = [{"start_time": new_date_beg,
+                           "end_time": date_end}]
+                sc_clock_df = get_telem(mnemonics, visits)
+                if len(sc_clock_df) > 0:
+                    break
+            # get data after the observation
+            while True:
+                new_date_end = (
+                        pd.to_datetime(new_date_end) + timedelta(hours=12)) \
+                    .strftime(dt_format)
+                visits = [{"start_time": date_beg,
+                           "end_time": new_date_end}]
+                sc_clock_df = get_telem(mnemonics, visits)
+                if len(sc_clock_df) > 0:
+                    break
+            # now fetch TLM in the new time window
+            visits = [{"start_time": new_date_beg,
+                       "end_time": new_date_end}]
+            sc_clock_df = get_telem(mnemonics, visits)
+
         # define expected results for optimizer
         expected = sc_clock_df['value'].values / 1e6
 
@@ -127,6 +157,10 @@ def compare_times(fits_fn):
             # correct for SC clock to ground error
             y_offset = np.mean(expected) - np.mean(predicted)
             predicted += y_offset
+
+            # TODO: handle cases where there is no TLM during the observation,
+            #  therefore no overlap ... we would need to do some extrapolation
+            #  or modeling instead
 
             # apply correction to DF times as well
             tmp_df['new_group_end_time'] = pd.to_datetime(
@@ -293,7 +327,6 @@ def compute_group_end_times(df, ngroups, nints,
         nresetrows, bkgd_row_reset_dur, nresets, tframe, drpfrms3, offset)
 
     # Obtain final group end time, convert to datetime object
-    dt_format = "%Y-%m-%dT%H:%M:%S.%f"
     group_end_datetime = pd.to_datetime(df['group_end_time'].iloc[-1])
 
     # Recursively calculate all group times backwards from the last entry
@@ -414,8 +447,8 @@ print('fits_fn, readpatt, subarray, f_discrepancies, mean_discrepancy(ms), max_d
 for fits_fn in fits_fns:
     # if 'jw05177001001_04102_00001' in fits_fn.name:
     # if ('jw02454' in fits_fn.name) & ('ALLSEG' in fits_fn.name):
-    if ('jw01729' in fits_fn.name) & ('seg' not in fits_fn.name):
+    # if ('jw01729' in fits_fn.name) & ('seg' not in fits_fn.name):
     # if ('jw03838001001_' in fits_fn.name) & ('seg' not in fits_fn.name):
-    # if 'nrs' in fits_fn.name:
+    if ('1492' in fits_fn.name) & ('nrs' in fits_fn.name) & ('seg' not in fits_fn.name):
     # if ('2457' in fits_fn.name) & ('nrs' in fits_fn.name):
         old_d, new_d = compare_times(fits_fn)
